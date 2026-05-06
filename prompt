@@ -1,3 +1,5 @@
+------------------------------------------------------------------------
+
 cd C:\Users\Mane\Desktop\Python\AI_Anime
 
 python -m venv .venv
@@ -6,6 +8,16 @@ python -m venv .venv
 python -m pip install --upgrade pip
 pip install huggingface_hub
 python .\download_ltx_models.py
+------------------------------------------------------------------------
+
+Test-Path .\models\ltx-video\ltx-video-2b-v0.9.safetensors
+Test-Path .\models\ltx-video\model_index.json
+Test-Path .\models\ltx-video\tokenizer
+Test-Path .\models\ltx-video\text_encoder
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
 
 
 Сначала прочитай AGENTS.md и дальше строго следуй правилам из него как базовой инструкции проекта. Не нужно повторно перечислять те же правила в отчёте или в дальнейших шагах: все обязательные условия уже зафиксированы в AGENTS.md.
@@ -73,3 +85,4 @@ python .\download_ltx_models.py
 3. Где теперь находится text_encoder в LOW_VRAM_MODE.
 4. Какие проверки запускал.
 5. Остался ли риск, что RTX 3050 4GB всё равно не вытянет генерацию.
+------------------------------------------------------------------------
