@@ -1,0 +1,75 @@
+cd C:\Users\Mane\Desktop\Python\AI_Anime
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+pip install huggingface_hub
+python .\download_ltx_models.py
+
+
+Сначала прочитай AGENTS.md и дальше строго следуй правилам из него как базовой инструкции проекта. Не нужно повторно перечислять те же правила в отчёте или в дальнейших шагах: все обязательные условия уже зафиксированы в AGENTS.md.
+
+Задача: targeted-fix main.py для LTX-Video low-VRAM режима.
+
+Контекст:
+- model/text_encoder/tokenizer уже найдены.
+- Pipeline загружается до конца.
+- Новая ошибка возникает во время encode_prompt внутри T5:
+  RuntimeError: CUDA error: CUBLAS_STATUS_NOT_SUPPORTED
+  cublasGemmEx(...)
+- Ошибка идёт из self.text_encoder(...), то есть T5 text_encoder работает на CUDA и падает.
+- Нужно сделать режим, где text_encoder остаётся на CPU, чтобы не грузить/не ломать CUDA на RTX 3050 4GB.
+
+Что сделать:
+1. Открой только main.py.
+2. Не меняй UI и общую архитектуру без необходимости.
+3. Добавь флаг/константу:
+   LOW_VRAM_MODE = True
+   или читай из config.py:
+   LOW_VRAM_MODE = getattr(config, "LOW_VRAM_MODE", True)
+4. При LOW_VRAM_MODE=True:
+   - загружай T5EncoderModel на CPU
+   - используй torch_dtype=torch.float32 для text_encoder, а не float16
+   - НЕ перемещай text_encoder на cuda вручную
+5. Pipeline transformer/vae можно оставить torch.float16.
+6. После создания pipe:
+   - если LOW_VRAM_MODE=True, используй pipe.enable_sequential_cpu_offload(), если доступен
+   - если sequential недоступен, fallback на pipe.enable_model_cpu_offload()
+   - pipe.to("cuda") использовать только если offload вообще недоступен
+7. После включения offload принудительно проверь/оставь:
+   pipe.text_encoder.to("cpu")
+   pipe.text_encoder.eval()
+8. Добавь memory-saving настройки:
+   - pipe.vae.enable_tiling(), если доступно
+   - pipe.vae.enable_slicing(), если доступно
+9. Перед генерацией:
+   - torch.cuda.empty_cache()
+   - gc.collect()
+10. Обработка ошибок:
+   - ловить torch.cuda.OutOfMemoryError
+   - ловить RuntimeError/Exception, если текст содержит:
+     "out of memory"
+     "CUBLAS_STATUS_NOT_SUPPORTED"
+     "cudaErrorMemoryAllocation"
+   - показывать gr.Error с понятным текстом:
+     "GPU memory/CUDA failed during prompt encoding. Try LOW_VRAM_MODE=True, 512x512, 3 seconds, 4 steps, or use GPU with more VRAM."
+11. UI defaults оставить лёгкими:
+   - duration = 3
+   - resolution = "512x512"
+   - steps default = 4
+   - steps min = 4
+12. Не добавляй скачивание моделей.
+13. Не трогай models/, inputs/, outputs/.
+
+Проверки:
+- python -m py_compile main.py
+- python main.py с TEST_MODE=True
+- python main.py с TEST_MODE=False и LOW_VRAM_MODE=True, 512x512, 3 sec, 4 steps
+
+Отчёт коротко:
+1. Что изменено.
+2. Какие файлы затронуты.
+3. Где теперь находится text_encoder в LOW_VRAM_MODE.
+4. Какие проверки запускал.
+5. Остался ли риск, что RTX 3050 4GB всё равно не вытянет генерацию.
