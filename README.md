@@ -80,3 +80,18 @@ TEST_MODE = False
 - `8-30` inference steps
 
 Если появится ошибка нехватки VRAM, приложение очистит CUDA cache и покажет понятное сообщение.
+~~~
+cd C:\Users\Mane\Desktop\Python\AI_Animepython -m venv .venv.\.venv\Scripts\Activate.ps1python -m pip install --upgrade pippip install huggingface_hub@'from pathlib import Pathfrom huggingface_hub import snapshot_downloadrepo_id = "Lightricks/LTX-Video"local_dir = Path("models/ltx-video")local_dir.mkdir(parents=True, exist_ok=True)snapshot_download(    repo_id=repo_id,    local_dir=str(local_dir),    allow_patterns=[        "ltx-video-2b-v0.9.safetensors",        "model_index.json",        "tokenizer/*",        "text_encoder/*",    ],)print("DONE: model files downloaded to", local_dir.resolve())'@ | Set-Content -Encoding UTF8 .\download_ltx_models.pypython .\download_ltx_models.py
+Потом проверка:
+Test-Path .\models\ltx-video\ltx-video-2b-v0.9.safetensorsTest-Path .\models\ltx-video\model_index.jsonTest-Path .\models\ltx-video\tokenizerTest-Path .\models\ltx-video\text_encoder
+Должно быть:
+TrueTrueTrueTrue
+Если скачивание медленное или будет warning про unauthenticated requests:
+hf auth loginpython .\download_ltx_models.py
+После этого уже ставишь зависимости проекта:
+pip install -r requirements.txt
+И запускаешь:
+python main.py
+
+
+~~~
