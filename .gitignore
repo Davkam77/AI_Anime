@@ -1,0 +1,165 @@
+# =========================================================
+# Python
+# =========================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.pyc
+
+# Python build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Pip / Python caches
+.cache/
+pip-cache/
+.python-version
+
+# =========================================================
+# Project runtime folders
+# =========================================================
+
+# Uploaded input images
+inputs/*
+!inputs/.gitkeep
+
+# Generated videos
+outputs/*
+!outputs/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# =========================================================
+# AI models / large files
+# =========================================================
+
+# Do not commit downloaded models
+models/*
+!models/.gitkeep
+
+# If you want to keep folder structure, these allow empty dirs only
+!models/ltx-video/
+models/ltx-video/*
+!models/ltx-video/.gitkeep
+
+# Large model/checkpoint formats
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.gguf
+*.ggml
+
+# Hugging Face local cache
+.cache/huggingface/
+**/.cache/huggingface/
+models/**/.cache/
+
+# Diffusers / transformers cache
+diffusers-cache/
+transformers-cache/
+
+# =========================================================
+# Environment / secrets
+# =========================================================
+.env
+.env.*
+!.env.example
+
+# Local config can be ignored if it is machine-specific
+# If config.py only contains TEST_MODE and should be shared, remove this line.
+config.local.py
+
+# =========================================================
+# Gradio
+# =========================================================
+gradio_cached_examples/
+flagged/
+.flagged/
+
+# =========================================================
+# Jupyter / notebooks
+# =========================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# =========================================================
+# IDE / editors
+# =========================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+# =========================================================
+# OS files
+# =========================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================================================
+# Windows / PowerShell
+# =========================================================
+*.lnk
+*.ps1xml
+*.psc1
+*.pssc
+
+# =========================================================
+# Test / coverage
+# =========================================================
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# =========================================================
+# Type checking / tooling caches
+# =========================================================
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# =========================================================
+# Node, if frontend/tools appear later
+# =========================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+
+# =========================================================
+# Keep important project files
+# =========================================================
+!main.py
+!requirements.txt
+!README.md
+!AGENTS.md
+!download_models.py
+!setup.ps1

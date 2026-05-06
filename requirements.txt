@@ -1,0 +1,25 @@
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+
+torch
+torchvision
+torchaudio
+
+gradio
+diffusers
+transformers
+accelerate
+safetensors
+huggingface_hub
+
+Pillow
+numpy
+opencv-python
+imageio
+imageio-ffmpeg
+av
+
+sentencepiece
+protobuf
+tqdm
+requests
