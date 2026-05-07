@@ -1,1 +1,2 @@
 TEST_MODE = False
+LOW_VRAM_MODE = True

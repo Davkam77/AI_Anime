@@ -22,6 +22,14 @@ OUTPUTS_DIR = BASE_DIR / "outputs"
 FPS = 24
 DEVICE = "cuda"
 NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
+CUDA_MEMORY_ERROR_MESSAGE = (
+    "GPU memory/CUDA failed during prompt encoding. Try LOW_VRAM_MODE=True, "
+    "512x512, 3 seconds, 4 steps, or use GPU with more VRAM."
+)
+DEVICE_MISMATCH_ERROR_MESSAGE = (
+    "Prompt encoding device mismatch in LOW_VRAM_MODE. Prompt embeddings are now "
+    "encoded on CPU before generation; restart the app and try again."
+)
 
 pipe = None
 
@@ -33,6 +41,28 @@ def get_test_mode():
         return False
 
     return bool(getattr(config, "TEST_MODE", False))
+
+
+def get_low_vram_mode():
+    try:
+        import config
+    except Exception:
+        return True
+
+    return bool(getattr(config, "LOW_VRAM_MODE", True))
+
+
+def is_cuda_memory_error(exc):
+    message = str(exc).lower()
+    return any(
+        marker.lower() in message
+        for marker in (
+            "out of memory",
+            "CUBLAS_STATUS_NOT_SUPPORTED",
+            "cudaErrorMemoryAllocation",
+            "Expected all tensors to be on the same device",
+        )
+    )
 
 
 def ensure_folders():
@@ -84,6 +114,8 @@ def load_pipe():
         )
 
     dtype = torch.float16
+    low_vram_mode = get_low_vram_mode()
+    text_encoder_dtype = torch.float32 if low_vram_mode else dtype
 
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -95,9 +127,12 @@ def load_pipe():
         )
         text_encoder = T5EncoderModel.from_pretrained(
             str(TEXT_ENCODER_DIR),
-            torch_dtype=dtype,
+            torch_dtype=text_encoder_dtype,
             local_files_only=True,
         )
+        if low_vram_mode:
+            text_encoder.to("cpu")
+            text_encoder.eval()
     except Exception as exc:
         raise gr.Error(
             "Failed to load local tokenizer/text_encoder.\n\n"
@@ -123,13 +158,36 @@ def load_pipe():
             "The app is offline and will not download replacement files."
         ) from exc
 
-    if hasattr(pipe, "enable_model_cpu_offload"):
+    offload_enabled = False
+    cpu_text_encoder = None
+    if low_vram_mode and hasattr(pipe, "text_encoder"):
+        cpu_text_encoder = pipe.text_encoder
+        pipe.text_encoder = None
+
+    if low_vram_mode and hasattr(pipe, "enable_sequential_cpu_offload"):
+        pipe.enable_sequential_cpu_offload()
+        offload_enabled = True
+    elif low_vram_mode and hasattr(pipe, "enable_model_cpu_offload"):
         pipe.enable_model_cpu_offload()
+        offload_enabled = True
+    elif hasattr(pipe, "enable_model_cpu_offload"):
+        pipe.enable_model_cpu_offload()
+        offload_enabled = True
     else:
         pipe.to(DEVICE)
 
+    if cpu_text_encoder is not None:
+        pipe.text_encoder = cpu_text_encoder
+
+    if low_vram_mode and hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+        pipe.text_encoder.to("cpu")
+        pipe.text_encoder.eval()
+
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
+
+    if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
+        pipe.vae.enable_slicing()
 
     return pipe
 
@@ -159,6 +217,53 @@ def frame_count(duration_seconds):
     return ((target - 2) // 8 + 1) * 8 + 1
 
 
+def encode_prompts_on_cpu(model, prompt, negative_prompt, max_sequence_length=128):
+    tokenizer = model.tokenizer
+    text_encoder = model.text_encoder
+    if tokenizer is None or text_encoder is None:
+        raise gr.Error("LOW_VRAM_MODE requires a loaded tokenizer and text_encoder.")
+
+    text_encoder.to("cpu")
+    text_encoder.eval()
+
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        truncation=True,
+        max_length=max_sequence_length,
+        return_tensors="pt",
+    )
+    negative_text_inputs = tokenizer(
+        negative_prompt,
+        padding="max_length",
+        truncation=True,
+        max_length=max_sequence_length,
+        return_tensors="pt",
+    )
+
+    input_ids = text_inputs.input_ids
+    negative_input_ids = negative_text_inputs.input_ids
+
+    with torch.inference_mode():
+        prompt_embeds = text_encoder(input_ids)[0]
+        negative_prompt_embeds = text_encoder(negative_input_ids)[0]
+
+    prompt_attention_mask = text_inputs.attention_mask
+    negative_prompt_attention_mask = negative_text_inputs.attention_mask
+
+    if prompt_embeds.shape != negative_prompt_embeds.shape:
+        raise gr.Error("Prompt and negative prompt embeddings have different shapes.")
+    if prompt_attention_mask.shape != negative_prompt_attention_mask.shape:
+        raise gr.Error("Prompt and negative prompt attention masks have different shapes.")
+
+    return (
+        prompt_embeds.to(dtype=torch.float16),
+        negative_prompt_embeds.to(dtype=torch.float16),
+        prompt_attention_mask,
+        negative_prompt_attention_mask,
+    )
+
+
 def generate_video(image_path, prompt, duration, resolution, seed, steps):
     ensure_folders()
 
@@ -173,6 +278,10 @@ def generate_video(image_path, prompt, duration, resolution, seed, steps):
     if get_test_mode():
         return None, "Test mode OK. Model generation skipped."
 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
     model = load_pipe()
     image = load_image(str(saved_image))
 
@@ -182,20 +291,53 @@ def generate_video(image_path, prompt, duration, resolution, seed, steps):
 
     try:
         with torch.inference_mode():
-            result = model(
-                image=image,
-                prompt=prompt,
-                negative_prompt=NEGATIVE_PROMPT,
-                width=width,
-                height=height,
-                num_frames=num_frames,
-                frame_rate=FPS,
-                num_inference_steps=int(steps),
-                generator=generator,
-                guidance_scale=3.0,
-                decode_timestep=0.05,
-                decode_noise_scale=0.025,
-            )
+            if get_low_vram_mode():
+                (
+                    prompt_embeds,
+                    negative_prompt_embeds,
+                    prompt_attention_mask,
+                    negative_prompt_attention_mask,
+                ) = encode_prompts_on_cpu(model, prompt, NEGATIVE_PROMPT)
+                execution_device = getattr(model, "_execution_device", torch.device(DEVICE))
+                prompt_embeds = prompt_embeds.to(execution_device)
+                negative_prompt_embeds = negative_prompt_embeds.to(execution_device)
+                prompt_attention_mask = prompt_attention_mask.to(execution_device)
+                negative_prompt_attention_mask = negative_prompt_attention_mask.to(execution_device)
+
+                result = model(
+                    image=image,
+                    prompt=None,
+                    negative_prompt=None,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    prompt_attention_mask=prompt_attention_mask,
+                    negative_prompt_attention_mask=negative_prompt_attention_mask,
+                    width=width,
+                    height=height,
+                    num_frames=num_frames,
+                    frame_rate=FPS,
+                    num_inference_steps=int(steps),
+                    generator=generator,
+                    guidance_scale=3.0,
+                    decode_timestep=0.05,
+                    decode_noise_scale=0.025,
+                    max_sequence_length=128,
+                )
+            else:
+                result = model(
+                    image=image,
+                    prompt=prompt,
+                    negative_prompt=NEGATIVE_PROMPT,
+                    width=width,
+                    height=height,
+                    num_frames=num_frames,
+                    frame_rate=FPS,
+                    num_inference_steps=int(steps),
+                    generator=generator,
+                    guidance_scale=3.0,
+                    decode_timestep=0.05,
+                    decode_noise_scale=0.025,
+                )
 
         export_to_video(result.frames[0], str(output_path), fps=FPS)
 
@@ -204,9 +346,20 @@ def generate_video(image_path, prompt, duration, resolution, seed, steps):
             torch.cuda.empty_cache()
         gc.collect()
         raise gr.Error(
-            "Not enough VRAM for generation.\n"
-            "Try 512x512, 3 seconds, or fewer inference steps."
+            CUDA_MEMORY_ERROR_MESSAGE
         ) from exc
+    except Exception as exc:
+        if "Expected all tensors to be on the same device" in str(exc):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            raise gr.Error(DEVICE_MISMATCH_ERROR_MESSAGE) from exc
+        if is_cuda_memory_error(exc):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            raise gr.Error(CUDA_MEMORY_ERROR_MESSAGE) from exc
+        raise
 
     return str(output_path), f"Done: {output_path}"
 
