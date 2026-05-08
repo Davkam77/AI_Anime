@@ -73,13 +73,13 @@ TEST_MODE = False
 
 ## RTX 3060 Ti 8GB
 
-Для меньшей нагрузки на VRAM используйте:
+Recommended presets:
 
-- `512x512`
-- `3 seconds`
-- `8-30` inference steps
+- Maximum quality: `768x512`, `5 seconds`, `30` inference steps, `LOW_VRAM_MODE=False`.
+- Fallback quality: `768x512`, `5 seconds`, `24-30` inference steps, `LOW_VRAM_MODE=True`.
+- Low VRAM: `512x512`, `3 seconds`, `12-20` inference steps, `LOW_VRAM_MODE=True`.
 
-Если появится ошибка нехватки VRAM, приложение очистит CUDA cache и покажет понятное сообщение.
+For fewer CUDA OOM errors, close Chrome, VSCode, Discord, game launchers, and other GPU/RAM-heavy apps before generation. On Windows with 16 GB RAM, set the pagefile to `24-32 GB`.
 ~~~
 cd C:\Users\Mane\Desktop\Python\AI_Animepython -m venv .venv.\.venv\Scripts\Activate.ps1python -m pip install --upgrade pippip install huggingface_hub@'from pathlib import Pathfrom huggingface_hub import snapshot_downloadrepo_id = "Lightricks/LTX-Video"local_dir = Path("models/ltx-video")local_dir.mkdir(parents=True, exist_ok=True)snapshot_download(    repo_id=repo_id,    local_dir=str(local_dir),    allow_patterns=[        "ltx-video-2b-v0.9.safetensors",        "model_index.json",        "tokenizer/*",        "text_encoder/*",    ],)print("DONE: model files downloaded to", local_dir.resolve())'@ | Set-Content -Encoding UTF8 .\download_ltx_models.pypython .\download_ltx_models.py
 Потом проверка:
