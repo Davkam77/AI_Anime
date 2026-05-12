@@ -1,15 +1,19 @@
-import os
-
-# Must be set before importing torch. Helps PyTorch avoid CUDA memory fragmentation.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
 import gc
+import os
 import shutil
 import time
 from pathlib import Path
 from typing import Any
+
+# Must be set before importing torch.
+# Some Windows/PyTorch builds ignore expandable_segments; warning is safe.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+# Allow tiny Diffusers config downloads by default.
+# The heavy model files are still loaded from local MODEL_FILE.
+os.environ.setdefault("HF_HUB_OFFLINE", "0")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")
 
 import gradio as gr
 import torch
@@ -19,50 +23,70 @@ from transformers import T5EncoderModel, T5Tokenizer
 
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = BASE_DIR / "models" / "ltx-video"
-MODEL_FILE = MODEL_DIR / "ltx-video-2b-v0.9.safetensors"
-TEXT_ENCODER_DIR = MODEL_DIR / "text_encoder"
-TOKENIZER_DIR = MODEL_DIR / "tokenizer"
+
+# Preferred model search order.
+# Put the new lightweight model here:
+#   models/ltx-video-fp8/ltxv-2b-0.9.8-distilled-fp8.safetensors
+# or here:
+#   models/ltx-video/ltxv-2b-0.9.8-distilled-fp8.safetensors
+DEFAULT_MODEL_CANDIDATES = [
+    BASE_DIR / "models" / "ltx-video-fp8" / "ltxv-2b-0.9.8-distilled-fp8.safetensors",
+    BASE_DIR / "models" / "ltx-video" / "ltxv-2b-0.9.8-distilled-fp8.safetensors",
+    BASE_DIR / "models" / "ltx-video" / "ltxv-2b-0.9.8-distilled.safetensors",
+    BASE_DIR / "models" / "ltx-video" / "ltx-video-2b-v0.9.safetensors",
+]
+
 INPUTS_DIR = BASE_DIR / "inputs"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 
 FPS = 24
 DEVICE = "cuda"
-NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted, deformed"
-CUDA_MEMORY_ERROR_MESSAGE = (
-    "Not enough VRAM. Try LOW_VRAM_MODE=True, 512x512, 3 seconds, "
-    "12-20 steps, close Chrome/VSCode."
-)
-DEVICE_MISMATCH_ERROR_MESSAGE = (
-    "Prompt encoding device mismatch. Restart the app and try LOW_VRAM_MODE=True."
+FORCE_LOW_VRAM_GB = 10.5
+
+NEGATIVE_PROMPT = (
+    "blurry, distorted, morphing, deformed character, unstable shape, flicker, "
+    "jittery motion, camera shake, low quality, melted details, text, watermark, logo"
 )
 
+CUDA_MEMORY_ERROR_MESSAGE = (
+    "Not enough GPU memory for this mode.\n\n"
+    "Use LOW_VRAM_MODE=True, 512x512, 3 seconds, 8-16 steps, guidance 3.0.\n"
+    "Close Chrome/VSCode/Discord and try again."
+)
+
+DEVICE_MISMATCH_ERROR_MESSAGE = (
+    "Prompt encoding device mismatch.\n\n"
+    "This usually means text_encoder is on CPU but the pipeline tried to encode prompt on CUDA.\n"
+    "Use LOW_VRAM_MODE=True. This build pre-encodes prompts on CPU in low-vram mode."
+)
+
+
 QUALITY_PRESETS = {
-    "balanced": {
-        "resolution": "768x512",
-        "duration": 3,
-        "steps": 24,
-        "guidance_scale": 3.0,
-        "low_vram": False,
-    },
-    "max_quality": {
-        "resolution": "768x512",
-        "duration": 5,
-        "steps": 30,
-        "guidance_scale": 3.0,
-        "low_vram": False,
-    },
     "low_vram": {
+        "resolution": "512x512",
+        "duration": 3,
+        "steps": 12,
+        "guidance_scale": 3.0,
+        "low_vram": True,
+    },
+    "balanced": {
         "resolution": "512x512",
         "duration": 3,
         "steps": 16,
         "guidance_scale": 3.0,
         "low_vram": True,
     },
+    "max_quality": {
+        "resolution": "768x512",
+        "duration": 3,
+        "steps": 24,
+        "guidance_scale": 3.0,
+        "low_vram": True,
+    },
 }
 
 pipe = None
-pipe_low_vram_mode: bool | None = None
+pipe_key: tuple[str, bool] | None = None
 
 
 def read_config_value(name: str, default: Any) -> Any:
@@ -77,9 +101,63 @@ def get_test_mode() -> bool:
     return bool(read_config_value("TEST_MODE", False))
 
 
+def get_configured_model_file() -> Path | None:
+    raw_model_file = read_config_value("MODEL_FILE", None)
+    if raw_model_file:
+        path = Path(str(raw_model_file))
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        return path
+
+    for candidate in DEFAULT_MODEL_CANDIDATES:
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def get_model_dir(model_file: Path | None = None) -> Path:
+    if model_file is None:
+        model_file = get_configured_model_file()
+
+    if model_file is not None:
+        return model_file.parent
+
+    return BASE_DIR / "models" / "ltx-video"
+
+
+def get_component_dir(name: str, model_file: Path | None = None) -> Path:
+    configured = read_config_value(f"{name.upper()}_DIR", None)
+    if configured:
+        path = Path(str(configured))
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        return path
+
+    model_dir = get_model_dir(model_file)
+    candidate = model_dir / name
+    if candidate.exists():
+        return candidate
+
+    fallback = BASE_DIR / "models" / "ltx-video" / name
+    if fallback.exists():
+        return fallback
+
+    return candidate
+
+
 def get_default_preset() -> str:
-    preset = str(read_config_value("QUALITY_PRESET", "max_quality")).strip().lower()
-    return preset if preset in QUALITY_PRESETS else "max_quality"
+    preset = str(read_config_value("QUALITY_PRESET", "low_vram")).strip().lower()
+    return preset if preset in QUALITY_PRESETS else "low_vram"
+
+
+def should_force_low_vram() -> bool:
+    if not torch.cuda.is_available():
+        return True
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    total_gb = props.total_memory / (1024 ** 3)
+    return total_gb <= FORCE_LOW_VRAM_GB
 
 
 def get_default_settings() -> dict[str, Any]:
@@ -93,11 +171,14 @@ def get_default_settings() -> dict[str, Any]:
 
     low_vram_default = bool(preset["low_vram"])
     low_vram = bool(read_config_value("LOW_VRAM_MODE", low_vram_default))
+    if should_force_low_vram():
+        low_vram = True
 
     if resolution not in {"512x512", "768x512"}:
         resolution = preset["resolution"]
     if duration not in {3, 5}:
         duration = preset["duration"]
+
     steps = max(4, min(30, steps))
     guidance_scale = max(1.0, min(7.0, guidance_scale))
 
@@ -112,20 +193,24 @@ def get_default_settings() -> dict[str, Any]:
 
 
 def preset_values(preset_name: str):
-    preset = QUALITY_PRESETS.get(str(preset_name), QUALITY_PRESETS["balanced"])
+    preset = QUALITY_PRESETS.get(str(preset_name), QUALITY_PRESETS["low_vram"])
+    low_vram = bool(preset["low_vram"])
+    if should_force_low_vram():
+        low_vram = True
+
     return (
         preset["resolution"],
         preset["duration"],
         preset["steps"],
         preset["guidance_scale"],
-        preset["low_vram"],
+        low_vram,
     )
 
 
 def is_cuda_memory_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return any(
-        marker.lower() in message
+        marker in message
         for marker in (
             "out of memory",
             "cuda out of memory",
@@ -140,51 +225,54 @@ def is_cuda_memory_error(exc: Exception) -> bool:
 def ensure_folders() -> None:
     INPUTS_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    (BASE_DIR / "models").mkdir(parents=True, exist_ok=True)
 
 
-def validate_model_file() -> None:
-    if not MODEL_FILE.exists():
+def validate_model_files(model_file: Path, tokenizer_dir: Path, text_encoder_dir: Path) -> None:
+    if not model_file.exists():
+        candidates = "\n".join(f"- {p}" for p in DEFAULT_MODEL_CANDIDATES)
         raise gr.Error(
             "Missing LTX-Video checkpoint.\n\n"
-            f"Expected file:\n{MODEL_FILE}\n\n"
-            "Put your already downloaded checkpoint at:\n"
-            "models/ltx-video/ltx-video-2b-v0.9.safetensors\n\n"
-            "This app does not download model files automatically."
+            "Expected one of these files:\n"
+            f"{candidates}\n\n"
+            "Recommended for RTX 3060 Ti 8GB:\n"
+            "models/ltx-video-fp8/ltxv-2b-0.9.8-distilled-fp8.safetensors"
         )
 
-    if not TEXT_ENCODER_DIR.exists():
+    if not tokenizer_dir.exists():
         raise gr.Error(
-            "Missing local text encoder.\n\n"
-            f"Expected folder:\n{TEXT_ENCODER_DIR}\n\n"
-            "Download/copy the LTX-Video text_encoder component into:\n"
-            "models/ltx-video/text_encoder/\n\n"
-            "Do not put it inside the .safetensors file. It must be a local folder."
+            "Missing local tokenizer folder.\n\n"
+            f"Expected folder:\n{tokenizer_dir}\n\n"
+            "Copy/download tokenizer into this folder."
         )
 
-    if not TOKENIZER_DIR.exists():
+    if not text_encoder_dir.exists():
         raise gr.Error(
-            "Missing local tokenizer.\n\n"
-            f"Expected folder:\n{TOKENIZER_DIR}\n\n"
-            "Download/copy the LTX-Video tokenizer component into:\n"
-            "models/ltx-video/tokenizer/\n\n"
-            "This app does not download tokenizer files automatically."
+            "Missing local text_encoder folder.\n\n"
+            f"Expected folder:\n{text_encoder_dir}\n\n"
+            "Copy/download text_encoder into this folder."
         )
 
 
 def clear_cuda_cache() -> None:
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
     gc.collect()
 
 
 def unload_pipe() -> None:
-    global pipe, pipe_low_vram_mode
+    global pipe, pipe_key
     if pipe is not None:
         del pipe
     pipe = None
-    pipe_low_vram_mode = None
+    pipe_key = None
     clear_cuda_cache()
 
 
@@ -210,6 +298,7 @@ def cuda_memory_snapshot() -> dict[str, str]:
 
 def format_status(settings: dict[str, Any], before: dict[str, str], after: dict[str, str] | None = None) -> str:
     lines = [
+        f"Model: {settings['model_file']}",
         f"Preset: {settings['preset']}",
         f"Resolution: {settings['resolution']}",
         f"Duration: {settings['duration']} sec",
@@ -226,32 +315,6 @@ def format_status(settings: dict[str, Any], before: dict[str, str], after: dict[
     return "\n".join(lines)
 
 
-def load_tokenizer_and_text_encoder(low_vram_mode: bool):
-    text_encoder_dtype = torch.float32 if low_vram_mode else torch.float16
-    try:
-        tokenizer = T5Tokenizer.from_pretrained(
-            str(TOKENIZER_DIR),
-            local_files_only=True,
-        )
-        text_encoder = T5EncoderModel.from_pretrained(
-            str(TEXT_ENCODER_DIR),
-            torch_dtype=text_encoder_dtype,
-            local_files_only=True,
-        )
-        if low_vram_mode:
-            text_encoder.to("cpu")
-            text_encoder.eval()
-        return tokenizer, text_encoder
-    except Exception as exc:
-        raise gr.Error(
-            "Failed to load local tokenizer/text_encoder.\n\n"
-            "Check that these folders contain valid local Hugging Face component files:\n"
-            f"- {TOKENIZER_DIR}\n"
-            f"- {TEXT_ENCODER_DIR}\n\n"
-            "The app is offline and will not download missing files."
-        ) from exc
-
-
 def configure_cuda_runtime() -> None:
     if not torch.cuda.is_available():
         return
@@ -259,79 +322,159 @@ def configure_cuda_runtime() -> None:
     torch.backends.cudnn.allow_tf32 = True
 
 
-def apply_memory_optimizations(model, low_vram_mode: bool):
-    offload_enabled = False
-    cpu_text_encoder = None
+def load_tokenizer_and_text_encoder(tokenizer_dir: Path, text_encoder_dir: Path, low_vram_mode: bool):
+    try:
+        tokenizer = T5Tokenizer.from_pretrained(
+            str(tokenizer_dir),
+            local_files_only=True,
+        )
 
-    # LOW_VRAM path keeps the text encoder on CPU and passes prompt embeddings manually.
-    # This avoids wasting VRAM during prompt encoding.
-    if low_vram_mode and hasattr(model, "text_encoder"):
-        cpu_text_encoder = model.text_encoder
-        model.text_encoder = None
+        text_encoder_dtype = torch.float32 if low_vram_mode else torch.float16
+        text_encoder = T5EncoderModel.from_pretrained(
+            str(text_encoder_dir),
+            torch_dtype=text_encoder_dtype,
+            local_files_only=True,
+        )
+
+        if low_vram_mode:
+            text_encoder.to("cpu")
+        else:
+            text_encoder.to(DEVICE)
+
+        text_encoder.eval()
+        return tokenizer, text_encoder
+
+    except Exception as exc:
+        raise gr.Error(
+            "Failed to load local tokenizer/text_encoder.\n\n"
+            f"Tokenizer:\n{tokenizer_dir}\n\n"
+            f"Text encoder:\n{text_encoder_dir}"
+        ) from exc
+
+
+def apply_memory_optimizations(model, low_vram_mode: bool) -> str:
+    if hasattr(model, "remove_all_hooks"):
+        try:
+            model.remove_all_hooks()
+        except Exception:
+            pass
 
     if low_vram_mode:
+        text_encoder = getattr(model, "text_encoder", None)
+
+        if text_encoder is not None:
+            text_encoder.to("cpu")
+            text_encoder.eval()
+
+        # Prevent Accelerate hooks from moving T5 to CUDA.
+        model.text_encoder = None
+
         if hasattr(model, "enable_sequential_cpu_offload"):
             model.enable_sequential_cpu_offload()
-            offload_enabled = True
+            offload_mode = "sequential_cpu_offload"
         elif hasattr(model, "enable_model_cpu_offload"):
             model.enable_model_cpu_offload()
-            offload_enabled = True
+            offload_mode = "model_cpu_offload"
         else:
+            # Last fallback. This can OOM.
             model.to(DEVICE)
-    else:
-        model.to(DEVICE)
+            offload_mode = "cuda_full_fallback"
 
-    if cpu_text_encoder is not None:
-        model.text_encoder = cpu_text_encoder
-        model.text_encoder.to("cpu")
-        model.text_encoder.eval()
+        model.text_encoder = text_encoder
+        if model.text_encoder is not None:
+            model.text_encoder.to("cpu")
+            model.text_encoder.eval()
 
-    if hasattr(model, "vae") and hasattr(model.vae, "enable_tiling"):
-        model.vae.enable_tiling()
+        if hasattr(model, "vae") and model.vae is not None:
+            if hasattr(model.vae, "enable_tiling"):
+                try:
+                    model.vae.enable_tiling()
+                except Exception:
+                    pass
+            if hasattr(model.vae, "enable_slicing"):
+                try:
+                    model.vae.enable_slicing()
+                except Exception:
+                    pass
 
-    if hasattr(model, "vae") and hasattr(model.vae, "enable_slicing"):
-        model.vae.enable_slicing()
+        print("LOW_VRAM_MODE:", True)
+        print("OFFLOAD_MODE:", offload_mode)
+        print("TEXT_ENCODER:", "cpu")
+        return offload_mode
 
-    if hasattr(model, "enable_attention_slicing"):
-        model.enable_attention_slicing("max")
+    model.to(DEVICE)
 
-    return offload_enabled
+    if hasattr(model, "vae") and model.vae is not None:
+        if hasattr(model.vae, "disable_slicing"):
+            try:
+                model.vae.disable_slicing()
+            except Exception:
+                pass
+        if hasattr(model.vae, "disable_tiling"):
+            try:
+                model.vae.disable_tiling()
+            except Exception:
+                pass
+
+    print("LOW_VRAM_MODE:", False)
+    print("OFFLOAD_MODE:", "full_gpu")
+    return "full_gpu"
 
 
 def load_pipe(low_vram_mode: bool):
-    global pipe, pipe_low_vram_mode
+    global pipe, pipe_key
 
-    if pipe is not None and pipe_low_vram_mode == low_vram_mode:
+    model_file = get_configured_model_file()
+    if model_file is None:
+        model_file = DEFAULT_MODEL_CANDIDATES[0]
+
+    tokenizer_dir = get_component_dir("tokenizer", model_file)
+    text_encoder_dir = get_component_dir("text_encoder", model_file)
+
+    current_key = (str(model_file), bool(low_vram_mode))
+    if pipe is not None and pipe_key == current_key:
         return pipe
 
-    if pipe is not None and pipe_low_vram_mode != low_vram_mode:
+    if pipe is not None and pipe_key != current_key:
         unload_pipe()
 
-    validate_model_file()
+    validate_model_files(model_file, tokenizer_dir, text_encoder_dir)
 
     if not torch.cuda.is_available():
         raise gr.Error(
-            "CUDA is not available. This project is configured for device=cuda.\n"
-            "Check your NVIDIA driver and the CUDA build of PyTorch."
+            "CUDA is not available. Check NVIDIA driver and CUDA PyTorch build."
         )
 
     configure_cuda_runtime()
-    tokenizer, text_encoder = load_tokenizer_and_text_encoder(low_vram_mode)
+    tokenizer, text_encoder = load_tokenizer_and_text_encoder(
+        tokenizer_dir=tokenizer_dir,
+        text_encoder_dir=text_encoder_dir,
+        low_vram_mode=low_vram_mode,
+    )
 
     try:
         model = LTXImageToVideoPipeline.from_single_file(
-            str(MODEL_FILE),
+            str(model_file),
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             torch_dtype=torch.float16,
-            local_files_only=True,
+            local_files_only=False,
         )
+
+        if hasattr(model, "remove_all_hooks"):
+            try:
+                model.remove_all_hooks()
+            except Exception:
+                pass
+
+        clear_cuda_cache()
+
     except Exception as exc:
         raise gr.Error(
             "Failed to load the local LTX-Video checkpoint.\n\n"
-            f"Checkpoint:\n{MODEL_FILE}\n\n"
-            "Check that the .safetensors file matches LTX-Video and is not corrupted.\n"
-            "The app is offline and will not download replacement files."
+            f"Checkpoint:\n{model_file}\n\n"
+            "If this is the new FP8 checkpoint, make sure your diffusers version supports it.\n"
+            "Also make sure tokenizer/ and text_encoder/ folders exist locally."
         ) from exc
 
     try:
@@ -346,7 +489,7 @@ def load_pipe(low_vram_mode: bool):
         raise
 
     pipe = model
-    pipe_low_vram_mode = low_vram_mode
+    pipe_key = current_key
     return pipe
 
 
@@ -379,7 +522,7 @@ def encode_prompts_on_cpu(model, prompt, negative_prompt, max_sequence_length=12
     tokenizer = model.tokenizer
     text_encoder = model.text_encoder
     if tokenizer is None or text_encoder is None:
-        raise gr.Error("LOW_VRAM_MODE requires a loaded tokenizer and text_encoder.")
+        raise gr.Error("LOW_VRAM_MODE requires tokenizer and text_encoder.")
 
     text_encoder.to("cpu")
     text_encoder.eval()
@@ -416,6 +559,74 @@ def encode_prompts_on_cpu(model, prompt, negative_prompt, max_sequence_length=12
     )
 
 
+def run_pipeline(
+    model,
+    image,
+    prompt,
+    negative_prompt,
+    width,
+    height,
+    num_frames,
+    steps,
+    generator,
+    guidance_scale,
+    low_vram_mode,
+):
+    if low_vram_mode:
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+            prompt_attention_mask,
+            negative_prompt_attention_mask,
+        ) = encode_prompts_on_cpu(
+            model=model,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            max_sequence_length=128,
+        )
+
+        execution_device = getattr(model, "_execution_device", torch.device(DEVICE))
+
+        prompt_embeds = prompt_embeds.to(device=execution_device, dtype=torch.float16)
+        negative_prompt_embeds = negative_prompt_embeds.to(device=execution_device, dtype=torch.float16)
+        prompt_attention_mask = prompt_attention_mask.to(device=execution_device)
+        negative_prompt_attention_mask = negative_prompt_attention_mask.to(device=execution_device)
+
+        return model(
+            image=image,
+            prompt=None,
+            negative_prompt=None,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            frame_rate=FPS,
+            num_inference_steps=steps,
+            generator=generator,
+            guidance_scale=guidance_scale,
+            decode_timestep=0.05,
+            decode_noise_scale=0.025,
+        )
+
+    return model(
+        image=image,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        frame_rate=FPS,
+        num_inference_steps=steps,
+        generator=generator,
+        guidance_scale=guidance_scale,
+        decode_timestep=0.05,
+        decode_noise_scale=0.025,
+    )
+
+
 def generate_video(image_path, prompt, quality_preset, low_vram_mode, duration, resolution, seed, steps, guidance_scale):
     ensure_folders()
 
@@ -423,15 +634,24 @@ def generate_video(image_path, prompt, quality_preset, low_vram_mode, duration, 
     if not prompt:
         raise gr.Error("Enter a prompt / scenario.")
 
-    quality_preset = str(quality_preset or "balanced")
+    quality_preset = str(quality_preset or "low_vram")
     low_vram_mode = bool(low_vram_mode)
+
+    # Hard safety: RTX 3060 Ti 8GB and weaker must not use full GPU mode.
+    if should_force_low_vram():
+        low_vram_mode = True
+
     width, height = parse_resolution(resolution)
     duration = int(duration)
     steps = int(steps)
     guidance_scale = float(guidance_scale)
     num_frames = frame_count(duration)
 
+    model_file = get_configured_model_file()
+    model_file_label = str(model_file) if model_file else "not found"
+
     settings = {
+        "model_file": model_file_label,
         "preset": quality_preset,
         "resolution": resolution,
         "duration": duration,
@@ -440,8 +660,8 @@ def generate_video(image_path, prompt, quality_preset, low_vram_mode, duration, 
         "guidance_scale": guidance_scale,
         "low_vram": low_vram_mode,
     }
-    before = cuda_memory_snapshot()
 
+    before = cuda_memory_snapshot()
     saved_image = save_input_image(image_path)
 
     if get_test_mode():
@@ -459,54 +679,19 @@ def generate_video(image_path, prompt, quality_preset, low_vram_mode, duration, 
         output_path = OUTPUTS_DIR / output_name
 
         with torch.inference_mode():
-            if low_vram_mode:
-                (
-                    prompt_embeds,
-                    negative_prompt_embeds,
-                    prompt_attention_mask,
-                    negative_prompt_attention_mask,
-                ) = encode_prompts_on_cpu(model, prompt, NEGATIVE_PROMPT)
-
-                execution_device = getattr(model, "_execution_device", torch.device(DEVICE))
-                prompt_embeds = prompt_embeds.to(execution_device)
-                negative_prompt_embeds = negative_prompt_embeds.to(execution_device)
-                prompt_attention_mask = prompt_attention_mask.to(execution_device)
-                negative_prompt_attention_mask = negative_prompt_attention_mask.to(execution_device)
-
-                result = model(
-                    image=image,
-                    prompt=None,
-                    negative_prompt=None,
-                    prompt_embeds=prompt_embeds,
-                    negative_prompt_embeds=negative_prompt_embeds,
-                    prompt_attention_mask=prompt_attention_mask,
-                    negative_prompt_attention_mask=negative_prompt_attention_mask,
-                    width=width,
-                    height=height,
-                    num_frames=num_frames,
-                    frame_rate=FPS,
-                    num_inference_steps=steps,
-                    generator=generator,
-                    guidance_scale=guidance_scale,
-                    decode_timestep=0.05,
-                    decode_noise_scale=0.025,
-                    max_sequence_length=128,
-                )
-            else:
-                result = model(
-                    image=image,
-                    prompt=prompt,
-                    negative_prompt=NEGATIVE_PROMPT,
-                    width=width,
-                    height=height,
-                    num_frames=num_frames,
-                    frame_rate=FPS,
-                    num_inference_steps=steps,
-                    generator=generator,
-                    guidance_scale=guidance_scale,
-                    decode_timestep=0.05,
-                    decode_noise_scale=0.025,
-                )
+            result = run_pipeline(
+                model=model,
+                image=image,
+                prompt=prompt,
+                negative_prompt=NEGATIVE_PROMPT,
+                width=width,
+                height=height,
+                num_frames=num_frames,
+                steps=steps,
+                generator=generator,
+                guidance_scale=guidance_scale,
+                low_vram_mode=low_vram_mode,
+            )
 
         export_to_video(result.frames[0], str(output_path), fps=FPS)
         after = cuda_memory_snapshot()
@@ -531,7 +716,10 @@ def build_ui():
 
     with gr.Blocks(title="Local LTX-Video") as demo:
         gr.Markdown("# Local LTX-Video")
-        gr.Markdown("Image-to-video: upload an image, write a prompt, then click Generate.")
+        gr.Markdown(
+            "Image-to-video: upload an image, write a prompt, then click Generate. "
+            "For RTX 3060 Ti 8GB use low_vram, 512x512, 3 sec, 8-16 steps."
+        )
 
         with gr.Row():
             with gr.Column():
@@ -539,7 +727,7 @@ def build_ui():
                 prompt = gr.Textbox(
                     label="Prompt / scenario",
                     lines=5,
-                    placeholder="Describe the motion, camera movement, scene details and lighting...",
+                    placeholder="Describe simple motion. Example: The robot gently moves its head and raises one hand. Static camera.",
                 )
                 quality_preset = gr.Dropdown(
                     choices=list(QUALITY_PRESETS.keys()),
